@@ -50,6 +50,21 @@ func NewBinlogParser() *BinlogParser {
 	return p
 }
 
+func (p *BinlogParser) Clone() *BinlogParser {
+	res := &BinlogParser{}
+	res.flavor = p.flavor
+	res.format = p.format
+	res.tables = p.tables
+	res.rawMode = p.rawMode
+	res.parseTime = p.parseTime
+	res.timestampStringLocation = p.timestampStringLocation
+	res.stopProcessing = p.stopProcessing
+	res.useDecimal = p.useDecimal
+	res.ignoreJSONDecodeErr = p.ignoreJSONDecodeErr
+	res.verifyChecksum = p.verifyChecksum
+	return res
+}
+
 func (p *BinlogParser) Stop() {
 	atomic.StoreUint32(&p.stopProcessing, 1)
 }
@@ -220,6 +235,10 @@ func (p *BinlogParser) parseHeader(data []byte) (*EventHeader, error) {
 	}
 
 	return h, nil
+}
+
+func (p *BinlogParser) parseType(data []byte) EventType {
+	return EventType(data[4])
 }
 
 func (p *BinlogParser) parseEvent(h *EventHeader, data []byte, rawData []byte) (Event, error) {

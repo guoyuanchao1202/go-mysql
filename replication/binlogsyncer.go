@@ -109,6 +109,24 @@ type BinlogSyncerConfig struct {
 	//Option function is used to set outside of BinlogSyncerConfig， between mysql connection and COM_REGISTER_SLAVE
 	//For MariaDB: slave_gtid_ignore_duplicates、skip_replication、slave_until_gtid
 	Option func(*client.Conn) error
+
+	// DisableQueryEventExtraInfo is used to disable gtid info in queryEvent
+	DisableQueryEventExtraInfo bool
+
+	// DisableXIDEventExtraInfo is used to disable gtid info in xid event
+	DisableXIDEventExtraInfo bool
+
+	// DisableGTIDUpdate is used to disable gtid update while receiving event
+	DisableGTIDUpdate bool
+
+	// EnableAsync is used to enable asyncProcessor
+	EnableAsync bool
+
+	// Concurrency is used to set asyncProcessor concurrency
+	Concurrency int
+
+	// BufferSize is used to set asyncProcessor bufferSize
+	BufferSize int
 }
 
 // BinlogSyncer syncs binlog event from server.
@@ -135,6 +153,10 @@ type BinlogSyncer struct {
 	lastConnectionID uint32
 
 	retryCount int
+
+	// used when enable asyncProcessor
+	processor                *asyncEventProcessor
+	prevEventIsTableMapEvent bool
 }
 
 // NewBinlogSyncer creates the BinlogSyncer with cfg.
@@ -159,6 +181,7 @@ func NewBinlogSyncer(cfg BinlogSyncerConfig) *BinlogSyncer {
 	b.parser.SetTimestampStringLocation(b.cfg.TimestampStringLocation)
 	b.parser.SetUseDecimal(b.cfg.UseDecimal)
 	b.parser.SetVerifyChecksum(b.cfg.VerifyChecksum)
+
 	b.running = false
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 
@@ -366,6 +389,13 @@ func (b *BinlogSyncer) startDumpStream() *BinlogStreamer {
 
 	s := newBinlogStreamer()
 
+	// if enable async, then init asyncProcessor
+	if b.cfg.EnableAsync {
+		b.processor = newAsyncEventProcessor(b.cfg.Concurrency, b.cfg.BufferSize, b.parser, s)
+		b.processor.SetUpdatePosAndFTIDCallback(b.doAdjustPosAndGTID)
+		b.processor.SetReplySemiSyncCallback(b.replySemiSyncACK)
+	}
+
 	b.wg.Add(1)
 	go b.onStream(s)
 	return s
@@ -567,8 +597,10 @@ func (b *BinlogSyncer) writeRegisterSlaveCommand() error {
 	return b.c.WritePacket(data)
 }
 
-func (b *BinlogSyncer) replySemiSyncACK(p Position) error {
+func (b *BinlogSyncer) replySemiSyncACK() error {
 	b.c.ResetSequence()
+
+	p := b.nextPos
 
 	data := make([]byte, 4+1+8+len(p.Name))
 	pos := 4
@@ -594,6 +626,11 @@ func (b *BinlogSyncer) retrySync() error {
 	defer b.m.Unlock()
 
 	b.parser.Reset()
+
+	// if enable async, need to reset asyncProcessor when retrySync
+	if b.cfg.EnableAsync {
+		b.processor.Reset()
+	}
 
 	if b.prevGset != nil {
 		msg := fmt.Sprintf("begin to re-sync from %s", b.prevGset.String())
@@ -660,7 +697,7 @@ func (b *BinlogSyncer) prepareSyncGTID(gset GTIDSet) error {
 func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 	defer func() {
 		if e := recover(); e != nil {
-			s.closeWithError(fmt.Errorf("Err: %v\n Stack: %s", e, Pstack()))
+			b.closeWithError(s, fmt.Errorf("Err: %v\n Stack: %s", e, Pstack()))
 		}
 		b.wg.Done()
 	}()
@@ -669,7 +706,7 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 		data, err := b.c.ReadPacket()
 		select {
 		case <-b.ctx.Done():
-			s.close()
+			b.closeWithError(s, nil)
 			return
 		default:
 		}
@@ -680,27 +717,27 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 			// last nextPos or nextGTID we got.
 			if len(b.nextPos.Name) == 0 && b.prevGset == nil {
 				// we can't get the correct position, close.
-				s.closeWithError(err)
+				b.closeWithError(s, err)
 				return
 			}
 
 			if b.cfg.DisableRetrySync {
 				log.Warn("retry sync is disabled")
-				s.closeWithError(err)
+				b.closeWithError(s, err)
 				return
 			}
 
 			for {
 				select {
 				case <-b.ctx.Done():
-					s.close()
+					b.closeWithError(s, nil)
 					return
 				case <-time.After(time.Second):
 					b.retryCount++
 					if err = b.retrySync(); err != nil {
 						if b.cfg.MaxReconnectAttempts > 0 && b.retryCount >= b.cfg.MaxReconnectAttempts {
 							log.Errorf("retry sync err: %v, exceeded max retries (%d)", err, b.cfg.MaxReconnectAttempts)
-							s.closeWithError(err)
+							b.closeWithError(s, err)
 							return
 						}
 
@@ -726,13 +763,13 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 
 		switch data[0] {
 		case OK_HEADER:
-			if err = b.parseEvent(s, data); err != nil {
-				s.closeWithError(err)
+			if err = b.handleOKPacket(s, data); err != nil {
+				b.closeWithError(s, err)
 				return
 			}
 		case ERR_HEADER:
 			err = b.c.HandleErrorPacket(data)
-			s.closeWithError(err)
+			b.closeWithError(s, err)
 			return
 		case EOF_HEADER:
 			// refer to https://dev.mysql.com/doc/internals/en/com-binlog-dump.html#binlog-dump-non-block
@@ -747,13 +784,149 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 	}
 }
 
+func (b *BinlogSyncer) closeWithError(s *BinlogStreamer, err error) {
+	// if enable async, just close asyncProcessor
+	if b.cfg.EnableAsync {
+		b.processor.stopWithError(err)
+		return
+	}
+
+	if err != nil {
+		s.closeWithError(err)
+		return
+	}
+
+	s.close()
+}
+
+// handleOKPacket A set of consecutive TableMapEvent and the following RowsEvent need to be sent to the same processor for processing
+func (b *BinlogSyncer) handleOKPacket(s *BinlogStreamer, data []byte) error {
+	// if not enable async, same as before
+	if !b.cfg.EnableAsync {
+		return b.parseEvent(s, data)
+	}
+
+	data = data[1:]
+	needACK := false
+	if b.cfg.SemiSyncEnabled && (data[0] == SemiSyncIndicator) {
+		needACK = data[1] == 0x01
+		//skip semi sync header
+		data = data[2:]
+	}
+
+	// get eventType
+	eventType := b.parser.parseType(data)
+
+	// Note: We need to ensure that there are no dependencies between events when concurrently parsing events,
+	// and in fact no dependencies have been found for all the other events so far except for rowsEvent and tableMapEvent.
+	// Since the resolution of rowsEvent depends on the previous tableMapEvent, we need to ensure that the tableMapEvent
+	// and the rowsEvent that depend on it need to be processed by the same worker.
+
+	switch eventType {
+	case TABLE_MAP_EVENT:
+		// There may be multiple tableMapEvent in transaction, then these consecutive tableMapEvent need to be processed by the same worker
+		if b.prevEventIsTableMapEvent {
+			b.processor.Process(data, false, false, false, needACK)
+		} else {
+			b.prevEventIsTableMapEvent = true
+			b.processor.Process(data, true, true, false, needACK)
+		}
+		return nil
+	case WRITE_ROWS_EVENTv0,
+		UPDATE_ROWS_EVENTv0,
+		DELETE_ROWS_EVENTv0,
+		WRITE_ROWS_EVENTv1,
+		DELETE_ROWS_EVENTv1,
+		UPDATE_ROWS_EVENTv1,
+		WRITE_ROWS_EVENTv2,
+		UPDATE_ROWS_EVENTv2,
+		DELETE_ROWS_EVENTv2:
+		// send rowsEvent to same worker as before tableMapEvent
+		b.processor.Process(data, false, false, false, needACK)
+	case FORMAT_DESCRIPTION_EVENT:
+		// For FORMAT_DESCRIPTION_EVENT, it needs to be sent to each worker, thus updating the `parser.format` to which these workers belong
+		b.processor.Process(data, true, false, true, needACK)
+	default:
+		b.processor.Process(data, true, false, false, needACK)
+	}
+
+	b.prevEventIsTableMapEvent = false
+	return nil
+}
+
+// update pos and gtid
+func (b *BinlogSyncer) doAdjustPosAndGTID(e *BinlogEvent) error {
+	if e.Header.LogPos > 0 {
+		// Some events like FormatDescriptionEvent return 0, ignore.
+		b.nextPos.Pos = e.Header.LogPos
+	}
+
+	switch event := e.Event.(type) {
+	case *RotateEvent:
+		b.nextPos.Name = string(event.NextLogName)
+		b.nextPos.Pos = uint32(event.Position)
+		log.Infof("rotate to %s", b.nextPos)
+	case *GTIDEvent:
+		if b.prevGset == nil || b.cfg.DisableGTIDUpdate {
+			break
+		}
+		u, _ := uuid.FromBytes(event.SID)
+		err := b.advanceCurrentGtidSet(fmt.Sprintf("%s:%d", u.String(), event.GNO))
+		if err != nil {
+			return err
+		}
+	case *MariadbGTIDEvent:
+		if b.prevGset == nil || b.cfg.DisableGTIDUpdate {
+			break
+		}
+		GTID := event.GTID
+		err := b.advanceCurrentGtidSet(fmt.Sprintf("%d-%d-%d", GTID.DomainID, GTID.ServerID, GTID.SequenceNumber))
+		if err != nil {
+			return err
+		}
+	case *XIDEvent:
+		if b.cfg.DisableXIDEventExtraInfo {
+			break
+		}
+		event.GSet = b.getCurrentGtidSet()
+	case *QueryEvent:
+		if b.cfg.DisableQueryEventExtraInfo {
+			break
+		}
+		event.GSet = b.getCurrentGtidSet()
+	}
+	return nil
+}
+
+func (b *BinlogSyncer) getCurrentGtidSet() GTIDSet {
+	if b.currGset == nil {
+		return nil
+	}
+	return b.currGset.Clone()
+}
+
+func (b *BinlogSyncer) advanceCurrentGtidSet(gtid string) error {
+	if b.currGset == nil {
+		b.currGset = b.prevGset.Clone()
+	}
+	prev := b.currGset.Clone()
+	err := b.currGset.Update(gtid)
+	if err == nil {
+		// right after reconnect we will see same gtid as we saw before, thus currGset will not get changed
+		if !b.currGset.Equal(prev) {
+			b.prevGset = prev
+		}
+	}
+	return err
+}
+
 func (b *BinlogSyncer) parseEvent(s *BinlogStreamer, data []byte) error {
 	//skip OK byte, 0x00
 	data = data[1:]
 
 	needACK := false
 	if b.cfg.SemiSyncEnabled && (data[0] == SemiSyncIndicator) {
-		needACK = (data[1] == 0x01)
+		needACK = data[1] == 0x01
 		//skip semi sync header
 		data = data[2:]
 	}
@@ -763,60 +936,8 @@ func (b *BinlogSyncer) parseEvent(s *BinlogStreamer, data []byte) error {
 		return errors.Trace(err)
 	}
 
-	if e.Header.LogPos > 0 {
-		// Some events like FormatDescriptionEvent return 0, ignore.
-		b.nextPos.Pos = e.Header.LogPos
-	}
-
-	getCurrentGtidSet := func() GTIDSet {
-		if b.currGset == nil {
-			return nil
-		}
-		return b.currGset.Clone()
-	}
-
-	advanceCurrentGtidSet := func(gtid string) error {
-		if b.currGset == nil {
-			b.currGset = b.prevGset.Clone()
-		}
-		prev := b.currGset.Clone()
-		err := b.currGset.Update(gtid)
-		if err == nil {
-			// right after reconnect we will see same gtid as we saw before, thus currGset will not get changed
-			if !b.currGset.Equal(prev) {
-				b.prevGset = prev
-			}
-		}
-		return err
-	}
-
-	switch event := e.Event.(type) {
-	case *RotateEvent:
-		b.nextPos.Name = string(event.NextLogName)
-		b.nextPos.Pos = uint32(event.Position)
-		log.Infof("rotate to %s", b.nextPos)
-	case *GTIDEvent:
-		if b.prevGset == nil {
-			break
-		}
-		u, _ := uuid.FromBytes(event.SID)
-		err := advanceCurrentGtidSet(fmt.Sprintf("%s:%d", u.String(), event.GNO))
-		if err != nil {
-			return errors.Trace(err)
-		}
-	case *MariadbGTIDEvent:
-		if b.prevGset == nil {
-			break
-		}
-		GTID := event.GTID
-		err := advanceCurrentGtidSet(fmt.Sprintf("%d-%d-%d", GTID.DomainID, GTID.ServerID, GTID.SequenceNumber))
-		if err != nil {
-			return errors.Trace(err)
-		}
-	case *XIDEvent:
-		event.GSet = getCurrentGtidSet()
-	case *QueryEvent:
-		event.GSet = getCurrentGtidSet()
+	if err := b.doAdjustPosAndGTID(e); err != nil {
+		return errors.Trace(err)
 	}
 
 	needStop := false
@@ -827,7 +948,7 @@ func (b *BinlogSyncer) parseEvent(s *BinlogStreamer, data []byte) error {
 	}
 
 	if needACK {
-		err := b.replySemiSyncACK(b.nextPos)
+		err := b.replySemiSyncACK()
 		if err != nil {
 			return errors.Trace(err)
 		}
