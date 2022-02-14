@@ -237,8 +237,11 @@ func (p *BinlogParser) parseHeader(data []byte) (*EventHeader, error) {
 	return h, nil
 }
 
-func (p *BinlogParser) parseType(data []byte) EventType {
-	return EventType(data[4])
+func (p *BinlogParser) parseType(data []byte) (EventType, error) {
+	if len(data) < EventTypeBitOffset+1 {
+		return EventType(0), fmt.Errorf("invalid data")
+	}
+	return EventType(data[EventTypeBitOffset]), nil
 }
 
 func (p *BinlogParser) parseEvent(h *EventHeader, data []byte, rawData []byte) (Event, error) {

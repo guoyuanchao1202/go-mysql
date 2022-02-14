@@ -815,7 +815,10 @@ func (b *BinlogSyncer) handleOKPacket(s *BinlogStreamer, data []byte) error {
 	}
 
 	// get eventType
-	eventType := b.parser.parseType(data)
+	eventType, err := b.parser.parseType(data)
+	if err != nil {
+		return errors.Trace(err)
+	}
 
 	// Note: We need to ensure that there are no dependencies between events when concurrently parsing events,
 	// and in fact no dependencies have been found for all the other events so far except for rowsEvent and tableMapEvent.
