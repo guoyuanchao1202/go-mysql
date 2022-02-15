@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	DefaultConcurrency = 8
-	DefaultBufferSize  = 32
+	DefaultConcurrency = 4
+	DefaultBufferSize  = 512
 	MaxConcurrency     = 2048
 )
 
@@ -76,8 +76,8 @@ func newAsyncEventProcessor(concurrency, bufferSize int, parser *BinlogParser, s
 		processQueues:     make([]chan *workerInput, 0, concurrency),
 		processBufferSize: bufferSize,
 		workerSelector:    uint64(concurrency - 1),
-		toAckSeqInput:     make(chan uint64),
-		ackSeqInput:       make(chan *ackInput, concurrency*20),
+		toAckSeqInput:     make(chan uint64, 4096),
+		ackSeqInput:       make(chan *ackInput, 4096),
 		streamer:          streamer,
 		parserTemplate:    parser,
 	}
@@ -181,7 +181,6 @@ func (p *asyncEventProcessor) SetReplySemiSyncCallback(callback func() error) {
 	p.replySemiSyncCallback = callback
 }
 
-
 func (p *asyncEventProcessor) worker(ch chan *workerInput) {
 	defer p.wg.Done()
 
@@ -224,7 +223,6 @@ func (p *asyncEventProcessor) worker(ch chan *workerInput) {
 	}
 }
 
-
 func (p *asyncEventProcessor) sendMessageToAllWorker(data []byte, sequence uint64, needSemiSync bool) {
 	firstMessage := true
 
@@ -264,7 +262,7 @@ func (p *asyncEventProcessor) ackEvent(ackInput *ackInput) {
 func (p *asyncEventProcessor) coordinate() {
 	defer p.wg.Done()
 
-	toAckSequenceQueue := make([]uint64, 0)
+	toAckSequenceQueue := make([]uint64, 0, 1024)
 	ackedSequenceSet := make(map[uint64]*ackInput)
 
 	for {
@@ -279,11 +277,13 @@ func (p *asyncEventProcessor) coordinate() {
 			ackedSequenceSet[input.sequence] = input
 
 			increaseSteps := 0
+
 			for _, toAckSeq := range toAckSequenceQueue {
 				ack, ok := ackedSequenceSet[toAckSeq]
 				if !ok {
 					break
 				}
+
 				increaseSteps++
 				delete(ackedSequenceSet, toAckSeq)
 

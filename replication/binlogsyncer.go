@@ -394,6 +394,7 @@ func (b *BinlogSyncer) startDumpStream() *BinlogStreamer {
 		b.processor = newAsyncEventProcessor(b.cfg.Concurrency, b.cfg.BufferSize, b.parser, s)
 		b.processor.SetUpdatePosAndFTIDCallback(b.doAdjustPosAndGTID)
 		b.processor.SetReplySemiSyncCallback(b.replySemiSyncACK)
+		b.processor.Start()
 	}
 
 	b.wg.Add(1)
