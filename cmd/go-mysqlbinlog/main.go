@@ -7,9 +7,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"runtime"
+	"time"
 
 	"github.com/pingcap/errors"
+	_ "net/http/pprof"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -36,20 +40,29 @@ func main() {
 
 	cfg := replication.BinlogSyncerConfig{
 		ServerID: 101,
-		Flavor:   *flavor,
+		Flavor:   "mysql",
 
-		Host:            *host,
-		Port:            uint16(*port),
-		User:            *user,
-		Password:        *password,
-		RawModeEnabled:  *rawMode,
-		SemiSyncEnabled: *semiSync,
-		UseDecimal:      true,
+		Host:                       "127.0.0.1",
+		Port:                       uint16(3306),
+		User:                       "root",
+		Password:                   "12345678",
+		UseDecimal:                 true,
+		EnableAsync:                true,
+		DisableQueryEventExtraInfo: true,
+		DisableGTIDUpdate:          true,
+		DisableXIDEventExtraInfo:   true,
+		RecvBufferSize:             1024 * 1024,
+		ReadTimeout:                60 * time.Second,
 	}
+	runtime.SetBlockProfileRate(1)
+
+	go func() {
+		panic(http.ListenAndServe(":8888", nil))
+	}()
 
 	b := replication.NewBinlogSyncer(cfg)
 
-	pos := mysql.Position{Name: *file, Pos: uint32(*pos)}
+	pos := mysql.Position{Name: "mysql-bin.000007", Pos: uint32(4)}
 	if len(*backupPath) > 0 {
 		// Backup will always use RawMode.
 		err := b.StartBackup(*backupPath, pos, 0)

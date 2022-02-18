@@ -155,8 +155,7 @@ type BinlogSyncer struct {
 	retryCount int
 
 	// used when enable asyncProcessor
-	processor                *asyncEventProcessor
-	prevEventIsTableMapEvent bool
+	processor *asyncEventProcessor
 }
 
 // NewBinlogSyncer creates the BinlogSyncer with cfg.
@@ -391,7 +390,7 @@ func (b *BinlogSyncer) startDumpStream() *BinlogStreamer {
 
 	// if enable async, then init asyncProcessor
 	if b.cfg.EnableAsync {
-		b.processor = newAsyncEventProcessor(b.cfg.Concurrency, b.cfg.BufferSize, b.parser, s)
+		b.processor = newAsyncEventProcessor(b.cfg.Concurrency, b.cfg.BufferSize, b.parser)
 		b.processor.SetUpdatePosAndFTIDCallback(b.doAdjustPosAndGTID)
 		b.processor.SetReplySemiSyncCallback(b.replySemiSyncACK)
 		b.processor.Start()
@@ -628,11 +627,6 @@ func (b *BinlogSyncer) retrySync() error {
 
 	b.parser.Reset()
 
-	// if enable async, need to reset asyncProcessor when retrySync
-	if b.cfg.EnableAsync {
-		b.processor.Reset()
-	}
-
 	if b.prevGset != nil {
 		msg := fmt.Sprintf("begin to re-sync from %s", b.prevGset.String())
 		if b.currGset != nil {
@@ -786,9 +780,13 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 }
 
 func (b *BinlogSyncer) closeWithError(s *BinlogStreamer, err error) {
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+
 	// if enable async, just close asyncProcessor
 	if b.cfg.EnableAsync {
-		b.processor.stopWithError(err)
+		b.processor.Close()
 		return
 	}
 
@@ -821,40 +819,7 @@ func (b *BinlogSyncer) handleOKPacket(s *BinlogStreamer, data []byte) error {
 		return errors.Trace(err)
 	}
 
-	// Note: We need to ensure that there are no dependencies between events when concurrently parsing events,
-	// and in fact no dependencies have been found for all the other events so far except for rowsEvent and tableMapEvent.
-	// Since the resolution of rowsEvent depends on the previous tableMapEvent, we need to ensure that the tableMapEvent
-	// and the rowsEvent that depend on it need to be processed by the same worker.
-
-	switch eventType {
-	case TABLE_MAP_EVENT:
-		// There may be multiple tableMapEvent in transaction, then these consecutive tableMapEvent need to be processed by the same worker
-		if b.prevEventIsTableMapEvent {
-			b.processor.Process(data, false, false, false, needACK)
-		} else {
-			b.prevEventIsTableMapEvent = true
-			b.processor.Process(data, true, true, false, needACK)
-		}
-		return nil
-	case WRITE_ROWS_EVENTv0,
-		UPDATE_ROWS_EVENTv0,
-		DELETE_ROWS_EVENTv0,
-		WRITE_ROWS_EVENTv1,
-		DELETE_ROWS_EVENTv1,
-		UPDATE_ROWS_EVENTv1,
-		WRITE_ROWS_EVENTv2,
-		UPDATE_ROWS_EVENTv2,
-		DELETE_ROWS_EVENTv2:
-		// send rowsEvent to same worker as before tableMapEvent
-		b.processor.Process(data, false, false, false, needACK)
-	case FORMAT_DESCRIPTION_EVENT:
-		// For FORMAT_DESCRIPTION_EVENT, it needs to be sent to each worker, thus updating the `parser.format` to which these workers belong
-		b.processor.Process(data, true, false, true, needACK)
-	default:
-		b.processor.Process(data, true, false, false, needACK)
-	}
-
-	b.prevEventIsTableMapEvent = false
+	b.processor.Process(eventType, data, needACK)
 	return nil
 }
 

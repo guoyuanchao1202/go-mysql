@@ -54,7 +54,7 @@ func (p *BinlogParser) Clone() *BinlogParser {
 	res := &BinlogParser{}
 	res.flavor = p.flavor
 	res.format = p.format
-	res.tables = p.tables
+	res.tables = make(map[uint64]*TableMapEvent)
 	res.rawMode = p.rawMode
 	res.parseTime = p.parseTime
 	res.timestampStringLocation = p.timestampStringLocation
