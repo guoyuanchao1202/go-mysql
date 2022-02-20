@@ -39,14 +39,15 @@ func main() {
 	flag.Parse()
 
 	cfg := replication.BinlogSyncerConfig{
-		ServerID: 101,
-		Flavor:   "mysql",
-
+		ServerID:                   101,
+		Flavor:                     "mysql",
 		Host:                       "127.0.0.1",
 		Port:                       uint16(3306),
 		User:                       "root",
 		Password:                   "12345678",
 		UseDecimal:                 true,
+		Concurrency:                16,
+		BufferSize:                 4096,
 		EnableAsync:                true,
 		DisableQueryEventExtraInfo: true,
 		DisableGTIDUpdate:          true,
