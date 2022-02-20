@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 const (
@@ -10,270 +11,344 @@ const (
 	DefaultQueueSize        = 4096
 	DefaultBufferedChanSize = 17
 	InitSequence            = uint64(1)
-	InitWorkerNo            = 0
 )
 
-type workerInput struct {
+// workerEntity worker input
+type workerEntity struct {
 	sequence   uint64 // batch sequence
 	initParser bool
-	events     []*eventInfo
+	events     []*binLogEvent
 }
 
-func (input *workerInput) setSequence(sequence uint64) *workerInput {
+func (input *workerEntity) setSequence(sequence uint64) *workerEntity {
 	input.sequence = sequence
 	return input
 }
 
-func (input *workerInput) addEvent(event *eventInfo) *workerInput {
-	if input.events == nil {
-		input.events = make([]*eventInfo, 0, 10)
-	}
+func (input *workerEntity) addEvent(event *binLogEvent) *workerEntity {
 	input.events = append(input.events, event)
 	return input
 }
 
-func (input *workerInput) setInitParser(initParser bool) *workerInput {
+func (input *workerEntity) setInitParser(initParser bool) *workerEntity {
 	input.initParser = initParser
 	return input
 }
 
-func (input *workerInput) reset() {
+func (input *workerEntity) reset() {
 	input.sequence = 0
 	input.initParser = false
 	input.events = input.events[:0]
 }
 
-type eventInfo struct {
+// binLogEvent binlog event
+type binLogEvent struct {
 	data              []byte // binlog event
 	enableSemiSyncAck bool   // need semiSync to mysql master
 }
 
-func (e *eventInfo) setData(data []byte) *eventInfo {
+func (e *binLogEvent) setData(data []byte) *binLogEvent {
 	e.data = data
 	return e
 }
 
-func (e *eventInfo) setEnableSemiSync(ack bool) *eventInfo {
-	e.enableSemiSyncAck = ack
+func (e *binLogEvent) setSemiSyncAck(semiSync bool) *binLogEvent {
+	e.enableSemiSyncAck = semiSync
 	return e
 }
 
-func (e *eventInfo) reset() *eventInfo {
+func (e *binLogEvent) reset() *binLogEvent {
 	e.data = nil
 	e.enableSemiSyncAck = false
 	return e
 }
 
+// asyncEventProcessor process binlog event with async
 type asyncEventProcessor struct {
-	ctx    context.Context // exit
-	cancel context.CancelFunc
-	close  bool
-	wg     sync.WaitGroup
+	sequence            uint64        // keep event order
+	*dispatcher                       // dispatch event
+	currentWorkerEntity *workerEntity // runtime info
+}
 
-	concurrency  int // concurrency
-	workerQueues []chan *workerInput
-	queueSize    int
+// dispatcher dispatch workerEntity to suitable worker
+type dispatcher struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	wg            sync.WaitGroup
+	locked        int32
+	dispatchQueue []*workerEntity // dispatcher info
+	*workerManager
+}
 
-	sequence            uint64 // keep event order
-	nextSendingSequence uint64
+func (d *dispatcher) addToPendingDispatchQueue(entity *workerEntity) {
+	d.mu.Lock()
+	d.dispatchQueue = append(d.dispatchQueue, entity)
+	d.mu.Unlock()
+}
 
-	currentWorkerInput *workerInput // runtime info
-	currentWorker      chan *workerInput
-	nextWorkerIndex    int
+func (d *dispatcher) getPendingDispatchQueue() []*workerEntity {
+	res := make([]*workerEntity, 0, 1024)
 
-	updatePosAndGTIDCallback func(e *BinlogEvent) error // callback
+	d.mu.Lock()
+	res = append(res, d.dispatchQueue...)
+	d.dispatchQueue = d.dispatchQueue[:0]
+	d.mu.Unlock()
+	return res
+}
+
+func (d *dispatcher) start() {
+	d.wg.Add(1)
+	go d.dispatch()
+	d.workerManager.start()
+}
+
+func (d *dispatcher) dispatch() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-ticker.C:
+			pending := d.getPendingDispatchQueue()
+
+			for _, entity := range pending {
+				// d.putWorkerEntity(entity)
+				d.submitToWorker(entity)
+			}
+
+			ticker.Reset(50 * time.Millisecond)
+		}
+	}
+}
+
+func (d *dispatcher) close() {
+	d.cancel()
+	d.wg.Wait()
+	d.workerManager.close()
+}
+
+// workerManager Manage all workers, who are ultimately responsible for parse binlog
+type workerManager struct {
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	wg                       sync.WaitGroup
+	nextSequence             uint64
+	concurrency              int // workers info
+	workerQueues             []chan *workerEntity
+	queueSize                int
+	currentWorkerQueue       chan *workerEntity
+	nextWorkerIndex          int
+	parserTemplate           *BinlogParser              // used to generate parser for every worker
+	updatePosAndGTIDCallback func(e *BinlogEvent) error // callback after parsing a binLog event
 	replySemiSyncCallback    func() error
-
-	parserTemplate *BinlogParser // parser
-
-	*workerInputPool // workerInput pool
+	*entityPool              // workerEntity pool
 }
 
-type workerInputPool struct {
-	inputPool             *sync.Pool // workInput pool
-	workerInputBufferChan chan *workerInput
-
-	eventPool       *sync.Pool
-	eventBufferChan chan *eventInfo
+func (wm *workerManager) SetUpdatePosAndFTIDCallback(callback func(e *BinlogEvent) error) {
+	wm.updatePosAndGTIDCallback = callback
 }
 
-//type goroutinePool struct {
-//	ctx      context.Context
-//	cancel   context.CancelFunc
-//	size     int
-//	argInput chan *workerInput
-//	idleNum  int32
-//}
-//
-//func (gp *goroutinePool) start() {
-//	for i := 0; i < gp.size; i++ {
-//		go func() {
-//			select {
-//			case <-gp.ctx.Done():
-//				return
-//			case input := <-gp.argInput:
-//				atomic.AddInt32(&gp.idleNum, -1)
-//
-//				atomic.AddInt32(&gp.idleNum, 1)
-//			}
-//		}()
-//	}
-//}
-//
-//func (gp *goroutinePool) submit(input *workerInput) {
-//	gp.argInput <- input
-//}
+func (wm *workerManager) SetReplySemiSyncCallback(callback func() error) {
+	wm.replySemiSyncCallback = callback
+}
 
-func newAsyncEventProcessor(concurrency int, queueSize int, parser *BinlogParser) *asyncEventProcessor {
-	p := &asyncEventProcessor{
-		wg:                  sync.WaitGroup{},
-		concurrency:         DefaultConcurrency,
-		workerQueues:        make([]chan *workerInput, DefaultConcurrency),
-		queueSize:           DefaultQueueSize,
-		sequence:            InitSequence,
-		nextSendingSequence: InitSequence,
-		nextWorkerIndex:     InitWorkerNo + 1,
-		parserTemplate:      parser,
+func (wm *workerManager) start() {
+	for i := 0; i < wm.concurrency; i++ {
+		wm.wg.Add(1)
+		wm.workerQueues = append(wm.workerQueues, make(chan *workerEntity, DefaultQueueSize))
+		go wm.worker(wm.workerQueues[i])
 	}
 
-	p.workerInputPool = &workerInputPool{
-		inputPool: &sync.Pool{
-			New: func() interface{} {
-				return &workerInput{}
-			},
-		},
-		workerInputBufferChan: make(chan *workerInput, DefaultBufferedChanSize),
-
-		eventPool: &sync.Pool{
-			New: func() interface{} {
-				return &eventInfo{}
-			},
-		},
-		eventBufferChan: make(chan *eventInfo, DefaultBufferedChanSize),
-	}
-
-	p.currentWorkerInput = p.getWorkerInput().setSequence(InitSequence)
-
-	p.ctx, p.cancel = context.WithCancel(context.Background())
-	return p
+	wm.currentWorkerQueue = wm.workerQueues[0]
 }
 
-// getWorkerInput get workerInput instance from pool
-func (p *asyncEventProcessor) getWorkerInput() (input *workerInput) {
+func (wm *workerManager) worker(queue chan *workerEntity) {
+	parser := wm.parserTemplate.Clone()
+	for {
+		select {
+		case <-wm.ctx.Done():
+			return
+		case entity := <-queue:
+
+			wm.putWorkerEntity(entity)
+			time.Sleep(10 * time.Second)
+			return
+
+			if entity.initParser {
+				e, err := parser.Parse(entity.events[0].data)
+				if err != nil {
+					panic("parse format failed")
+				}
+				parser.format = e.Event.(*FormatDescriptionEvent)
+				wm.putWorkerEntity(entity)
+				continue
+			}
+
+			for _, binlogEvent := range entity.events {
+				e, err := parser.Parse(binlogEvent.data)
+				if err != nil {
+					panic("parse normal event failed")
+				}
+
+				if e.Header.EventType == ROTATE_EVENT && string(e.Event.(*RotateEvent).NextLogName) == "mysql-bin.000014" {
+					panic("big transaction, return")
+				}
+
+				if err := wm.updatePosAndGTIDCallback(e); err != nil {
+					panic("update pos failed")
+				}
+
+				if binlogEvent.enableSemiSyncAck && wm.replySemiSyncCallback != nil {
+					if err := wm.replySemiSyncCallback(); err != nil {
+						panic("semiSync failed")
+					}
+				}
+			}
+
+			wm.putWorkerEntity(entity)
+
+		}
+	}
+}
+
+func (wm *workerManager) initAllWorkerParser(entity *workerEntity) {
+	for _, worker := range wm.workerQueues {
+		worker <- wm.getWorkerEntity().setInitParser(true).addEvent(wm.getBinlogEvent().setData(entity.events[0].data))
+	}
+}
+
+func (wm *workerManager) submitToWorker(entity *workerEntity) {
+	if entity.initParser {
+		wm.initAllWorkerParser(entity)
+	}
+
+	wm.currentWorkerQueue <- entity.setInitParser(false)
+	wm.currentWorkerQueue = wm.workerQueues[wm.nextWorkerIndex]
+	wm.nextWorkerIndex = (wm.nextWorkerIndex + 1) % wm.concurrency
+
+}
+
+func (wm *workerManager) close() {
+	wm.cancel()
+	wm.wg.Wait()
+}
+
+// entityPool cache workerEntity to avoid frequent creation of objects
+type entityPool struct {
+	workerEntityPool       *sync.Pool // workerEntity pool
+	workerEntityBufferChan chan *workerEntity
+
+	binLogEventPool       *sync.Pool // binLogEvent pool
+	binLogEventBufferChan chan *binLogEvent
+}
+
+// getWorkerEntity get workerEntity instance from pool
+func (pool *entityPool) getWorkerEntity() (entity *workerEntity) {
 	select {
-	case input = <-p.workerInputBufferChan:
+	case entity = <-pool.workerEntityBufferChan:
 	default:
-		input = p.inputPool.Get().(*workerInput)
+		entity = pool.workerEntityPool.Get().(*workerEntity)
 	}
 
-	input.reset()
+	entity.reset()
 	return
 }
 
-// putWorkerInput put workerInput instance to pool
-func (p *asyncEventProcessor) putWorkerInput(input *workerInput) {
-	if input == nil {
+// putWorkerEntity put workerEntity instance to pool
+func (pool *entityPool) putWorkerEntity(entity *workerEntity) {
+	if entity == nil {
 		return
 	}
 
 	// put event to pool
-	for _, event := range input.events {
-		p.putEventInfo(event)
+	for _, event := range entity.events {
+		pool.putBinlogEvent(event)
 	}
 
 	select {
-	case p.workerInputBufferChan <- input:
+	case pool.workerEntityBufferChan <- entity:
 	default:
-		p.inputPool.Put(input)
+		pool.workerEntityPool.Put(entity)
 	}
 }
 
-func (p *asyncEventProcessor) getEventInfo() (event *eventInfo) {
+func (pool *entityPool) getBinlogEvent() (event *binLogEvent) {
 	select {
-	case event = <-p.eventBufferChan:
+	case event = <-pool.binLogEventBufferChan:
 	default:
-		event = p.eventPool.Get().(*eventInfo)
+		event = pool.binLogEventPool.Get().(*binLogEvent)
 	}
 
 	event.reset()
 	return
 }
 
-func (p *asyncEventProcessor) putEventInfo(event *eventInfo) {
+func (pool *entityPool) putBinlogEvent(event *binLogEvent) {
 	if event == nil {
 		return
 	}
 
 	select {
-	case p.eventBufferChan <- event:
+	case pool.binLogEventBufferChan <- event:
 	default:
-		p.eventPool.Put(event)
+		pool.binLogEventPool.Put(event)
 	}
+}
+
+func newAsyncEventProcessor(concurrency int, queueSize int, parser *BinlogParser) *asyncEventProcessor {
+	wm := &workerManager{
+		wg:              sync.WaitGroup{},
+		nextSequence:    InitSequence,
+		concurrency:     concurrency,
+		queueSize:       queueSize,
+		nextWorkerIndex: 1 % concurrency,
+		parserTemplate:  parser,
+	}
+
+	wm.entityPool = &entityPool{
+		workerEntityPool: &sync.Pool{
+			New: func() interface{} {
+				return &workerEntity{
+					events: make([]*binLogEvent, 0, 10),
+				}
+			},
+		},
+		workerEntityBufferChan: make(chan *workerEntity, DefaultBufferedChanSize),
+
+		binLogEventPool: &sync.Pool{
+			New: func() interface{} {
+				return &binLogEvent{}
+			},
+		},
+		binLogEventBufferChan: make(chan *binLogEvent, DefaultBufferedChanSize),
+	}
+
+	wm.ctx, wm.cancel = context.WithCancel(context.Background())
+
+	dis := &dispatcher{
+		wg:            sync.WaitGroup{},
+		locked:        1,
+		dispatchQueue: make([]*workerEntity, 0, 1024),
+		workerManager: wm,
+	}
+	dis.ctx, dis.cancel = context.WithCancel(context.Background())
+
+	p := &asyncEventProcessor{
+		sequence:            InitSequence,
+		dispatcher:          dis,
+		currentWorkerEntity: dis.getWorkerEntity().setSequence(InitSequence),
+	}
+
+	return p
 }
 
 func (p *asyncEventProcessor) Start() {
-
-	for i := 0; i < p.concurrency; i++ {
-
-		p.wg.Add(1)
-		p.workerQueues[i] = make(chan *workerInput, p.queueSize)
-
-		go p.worker()
-
-	}
-
-	p.currentWorker = p.workerQueues[InitWorkerNo]
-
+	p.start()
 }
 
 func (p *asyncEventProcessor) Close() {
-	p.close = true
-	p.cancel()
-	p.wg.Wait()
-}
-
-func (p *asyncEventProcessor) worker() {
-	defer func() {
-		p.wg.Done()
-	}()
-
-	var format *FormatDescriptionEvent
-	pending := make([]*workerInput, 0)
-	parser := p.parserTemplate.Clone()
-
-	for input := range p.currentWorker {
-		if p.close {
-			return
-		}
-
-		// if initParser, just parse and init, then drop it
-		if input.initParser {
-			event, err := parser.Parse(input.events[0].data)
-			if err != nil {
-				return
-			}
-			format = event.Event.(*FormatDescriptionEvent)
-			parser.format = format
-		}
-
-		pending = append(pending, input)
-
-		select {
-
-		default:
-
-		}
-
-		p.putWorkerInput(input)
-	}
-}
-
-func (p *asyncEventProcessor) SetUpdatePosAndFTIDCallback(callback func(e *BinlogEvent) error) {
-	p.updatePosAndGTIDCallback = callback
-}
-
-func (p *asyncEventProcessor) SetReplySemiSyncCallback(callback func() error) {
-	p.replySemiSyncCallback = callback
+	p.close()
 }
 
 // Process receive event binlog
@@ -283,7 +358,7 @@ func (p *asyncEventProcessor) Process(eventType EventType, data []byte, enableSe
 		return
 	}
 
-	if eventType == XID_EVENT {
+	if eventType == XID_EVENT || eventType == HEARTBEAT_EVENT {
 		p.processXIDEvent(data, enableSemiSyncAck)
 		return
 	}
@@ -293,33 +368,25 @@ func (p *asyncEventProcessor) Process(eventType EventType, data []byte, enableSe
 
 // processFormatDescriptionEvent need to send this event to all worker to init parser
 func (p *asyncEventProcessor) processFormatDescriptionEvent(data []byte, enableSemiSyncAck bool) {
-
-	p.currentWorkerInput.addEvent(p.getEventInfo().setData(data).setEnableSemiSync(enableSemiSyncAck))
-
-	for _, worker := range p.workerQueues {
-		worker <- p.getWorkerInput().addEvent(p.getEventInfo().setData(data)).setInitParser(true)
-	}
+	p.addToDispatchQueue()
+	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck)).setInitParser(true)
+	p.addToDispatchQueue()
 }
 
 // processNormalEvent just add to current transaction buffer
 func (p *asyncEventProcessor) processNormalEvent(data []byte, enableSemiSyncAck bool) {
-
-	p.currentWorkerInput.addEvent(p.getEventInfo().setData(data).setEnableSemiSync(enableSemiSyncAck))
+	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck))
 }
 
 // processXIDEvent send current transaction to current worker and change worker
 func (p *asyncEventProcessor) processXIDEvent(data []byte, enableSemiSyncAck bool) {
-
-	p.currentWorkerInput.addEvent(p.getEventInfo().setData(data).setEnableSemiSync(enableSemiSyncAck))
-
-	p.currentWorker <- p.currentWorkerInput
-
-	p.changeWorker()
+	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck))
+	p.addToDispatchQueue()
 }
 
-func (p *asyncEventProcessor) changeWorker() {
+// addToDispatchQueue send currentWorkerEntity to dispatcher
+func (p *asyncEventProcessor) addToDispatchQueue() {
+	p.addToPendingDispatchQueue(p.currentWorkerEntity)
 	p.sequence++
-	p.currentWorker = p.workerQueues[p.nextWorkerIndex]
-	p.nextWorkerIndex = (p.nextWorkerIndex + 1) % p.concurrency
-	p.currentWorkerInput = p.getWorkerInput().setSequence(p.sequence)
+	p.currentWorkerEntity = p.getWorkerEntity().setSequence(p.sequence)
 }
