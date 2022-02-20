@@ -6,10 +6,14 @@ import (
 	"time"
 )
 
+// todo: 测试不使用任何channel
+// todo: 测试不使用批量
+// todo: 优化parse函数
+
 const (
-	DefaultConcurrency      = 8
-	DefaultQueueSize        = 4096
-	DefaultBufferedChanSize = 17
+	DefaultConcurrency      = 16
+	DefaultQueueSize        = 2048
+	DefaultBufferedChanSize = 64
 	InitSequence            = uint64(1)
 )
 
@@ -104,20 +108,19 @@ func (d *dispatcher) start() {
 }
 
 func (d *dispatcher) dispatch() {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(10 * time.Millisecond)
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
 		case <-ticker.C:
+
 			pending := d.getPendingDispatchQueue()
 
 			for _, entity := range pending {
-				// d.putWorkerEntity(entity)
 				d.submitToWorker(entity)
 			}
-
-			ticker.Reset(50 * time.Millisecond)
+			ticker.Reset(10 * time.Millisecond)
 		}
 	}
 }
@@ -164,57 +167,125 @@ func (wm *workerManager) start() {
 }
 
 func (wm *workerManager) worker(queue chan *workerEntity) {
-	parser := wm.parserTemplate.Clone()
-	for {
-		select {
-		case <-wm.ctx.Done():
-			return
-		case entity := <-queue:
+	//parser := wm.parserTemplate.Clone()
 
-			wm.putWorkerEntity(entity)
-			time.Sleep(10 * time.Second)
-			return
-
-			if entity.initParser {
-				e, err := parser.Parse(entity.events[0].data)
-				if err != nil {
-					panic("parse format failed")
-				}
-				parser.format = e.Event.(*FormatDescriptionEvent)
-				wm.putWorkerEntity(entity)
-				continue
-			}
-
-			for _, binlogEvent := range entity.events {
-				e, err := parser.Parse(binlogEvent.data)
-				if err != nil {
-					panic("parse normal event failed")
-				}
-
-				if e.Header.EventType == ROTATE_EVENT && string(e.Event.(*RotateEvent).NextLogName) == "mysql-bin.000014" {
-					panic("big transaction, return")
-				}
-
-				if err := wm.updatePosAndGTIDCallback(e); err != nil {
-					panic("update pos failed")
-				}
-
-				if binlogEvent.enableSemiSyncAck && wm.replySemiSyncCallback != nil {
-					if err := wm.replySemiSyncCallback(); err != nil {
-						panic("semiSync failed")
-					}
-				}
-			}
-
-			wm.putWorkerEntity(entity)
-
-		}
-	}
+	//pending := make([]*workerEntity, 0, 1024)
+	//ticker := time.NewTicker(10 * time.Millisecond)
+	//for entity := range queue {
+	//	if entity.initParser {
+	//		e, err := parser.Parse(entity.events[0].data)
+	//		if err != nil {
+	//			panic("parse format failed")
+	//		}
+	//		parser.format = e.Event.(*FormatDescriptionEvent)
+	//		// wm.putWorkerEntity(entity)
+	//		continue
+	//	}
+	//
+	//	for _, event := range entity.events {
+	//		_, _ = parser.Parse(event.data)
+	//	}
+	//}
+	//for {
+	//	select {
+	//	case <-wm.ctx.Done():
+	//		return
+	//	case entity := <-queue:
+	//		if entity.initParser {
+	//			e, err := parser.Parse(entity.events[0].data)
+	//			if err != nil {
+	//				panic("parse format failed")
+	//			}
+	//			parser.format = e.Event.(*FormatDescriptionEvent)
+	//			// wm.putWorkerEntity(entity)
+	//			continue
+	//		}
+	//
+	//		for _, event := range entity.events {
+	//			_, _ = parser.Parse(event.data)
+	//		}
+	//
+	//
+	//		// pending = append(pending, entity)
+	//
+	//	//case <-ticker.C:
+	//	//
+	//	//	if len(pending) == 0 {
+	//	//		ticker.Reset(10 * time.Millisecond)
+	//	//		continue
+	//	//	}
+	//	//
+	//	//	// increaseStep := 0
+	//	//	for _, entity := range pending {
+	//	//
+	//	//		for _, event := range entity.events {
+	//	//			_, _ = parser.Parse(event.data)
+	//	//		}
+	//	//
+	//	//		// wm.putWorkerEntity(entity)
+	//	//		continue
+	//	//
+	//	//		//if entity.sequence != wm.nextSequence {
+	//	//		//	ticker.Reset(10 * time.Millisecond)
+	//	//		//	continue
+	//	//		//}
+	//	//		//
+	//	//		//for _, event := range entity.events {
+	//	//		//
+	//	//		//	e, err := parser.Parse(event.data)
+	//	//		//	if err != nil {
+	//	//		//		panic(fmt.Sprintf("parse normal event failed: %s", err.Error()))
+	//	//		//	}
+	//	//		//
+	//	//		//	if e.Header.EventType == ROTATE_EVENT {
+	//	//		//		if string(e.Event.(*RotateEvent).NextLogName) == "mysql-bin.000014" {
+	//	//		//			panic("big transaction, return")
+	//	//		//		}
+	//	//		//
+	//	//		//		fmt.Println(string(e.Event.(*RotateEvent).NextLogName))
+	//	//		//	}
+	//	//		//
+	//	//		//	if err := wm.updatePosAndGTIDCallback(e); err != nil {
+	//	//		//		panic("update pos failed")
+	//	//		//	}
+	//	//		//
+	//	//		//	if event.enableSemiSyncAck && wm.replySemiSyncCallback != nil {
+	//	//		//		if err := wm.replySemiSyncCallback(); err != nil {
+	//	//		//			panic("semiSync failed")
+	//	//		//		}
+	//	//		//	}
+	//	//		//}
+	//	//		//
+	//	//		//increaseStep++
+	//	//		//wm.nextSequence++
+	//	//		//wm.putWorkerEntity(entity)
+	//	//	}
+	//	//
+	//	//	pending = pending[:0]
+	//	//
+	//	//	ticker.Reset(10 * time.Millisecond)
+	//
+	//	}
+	//}
 }
 
+//func (wm *workerManager) initAllWorkerParser(entity *workerEntity) {
+//	for _, worker := range wm.workerQueues {
+//		worker <- wm.getWorkerEntity().setInitParser(true).addEvent(wm.getBinlogEvent().setData(entity.events[0].data))
+//	}
+//}
+
 func (wm *workerManager) initAllWorkerParser(entity *workerEntity) {
+
 	for _, worker := range wm.workerQueues {
-		worker <- wm.getWorkerEntity().setInitParser(true).addEvent(wm.getBinlogEvent().setData(entity.events[0].data))
+		worker <- &workerEntity{
+			initParser: true,
+			events: []*binLogEvent{
+				{
+					data: entity.events[0].data,
+				},
+			},
+		}
 	}
 }
 
@@ -244,57 +315,57 @@ type entityPool struct {
 }
 
 // getWorkerEntity get workerEntity instance from pool
-func (pool *entityPool) getWorkerEntity() (entity *workerEntity) {
-	select {
-	case entity = <-pool.workerEntityBufferChan:
-	default:
-		entity = pool.workerEntityPool.Get().(*workerEntity)
-	}
-
-	entity.reset()
-	return
-}
-
-// putWorkerEntity put workerEntity instance to pool
-func (pool *entityPool) putWorkerEntity(entity *workerEntity) {
-	if entity == nil {
-		return
-	}
-
-	// put event to pool
-	for _, event := range entity.events {
-		pool.putBinlogEvent(event)
-	}
-
-	select {
-	case pool.workerEntityBufferChan <- entity:
-	default:
-		pool.workerEntityPool.Put(entity)
-	}
-}
-
-func (pool *entityPool) getBinlogEvent() (event *binLogEvent) {
-	select {
-	case event = <-pool.binLogEventBufferChan:
-	default:
-		event = pool.binLogEventPool.Get().(*binLogEvent)
-	}
-
-	event.reset()
-	return
-}
-
-func (pool *entityPool) putBinlogEvent(event *binLogEvent) {
-	if event == nil {
-		return
-	}
-
-	select {
-	case pool.binLogEventBufferChan <- event:
-	default:
-		pool.binLogEventPool.Put(event)
-	}
-}
+//func (pool *entityPool) getWorkerEntity() (entity *workerEntity) {
+//	select {
+//	case entity = <-pool.workerEntityBufferChan:
+//	default:
+//		entity = pool.workerEntityPool.Get().(*workerEntity)
+//	}
+//
+//	entity.reset()
+//	return
+//}
+//
+//// putWorkerEntity put workerEntity instance to pool
+//func (pool *entityPool) putWorkerEntity(entity *workerEntity) {
+//	if entity == nil {
+//		return
+//	}
+//
+//	// put event to pool
+//	for _, event := range entity.events {
+//		pool.putBinlogEvent(event)
+//	}
+//
+//	select {
+//	case pool.workerEntityBufferChan <- entity:
+//	default:
+//		pool.workerEntityPool.Put(entity)
+//	}
+//}
+//
+//func (pool *entityPool) getBinlogEvent() (event *binLogEvent) {
+//	select {
+//	case event = <-pool.binLogEventBufferChan:
+//	default:
+//		event = pool.binLogEventPool.Get().(*binLogEvent)
+//	}
+//
+//	event.reset()
+//	return
+//}
+//
+//func (pool *entityPool) putBinlogEvent(event *binLogEvent) {
+//	if event == nil {
+//		return
+//	}
+//
+//	select {
+//	case pool.binLogEventBufferChan <- event:
+//	default:
+//		pool.binLogEventPool.Put(event)
+//	}
+//}
 
 func newAsyncEventProcessor(concurrency int, queueSize int, parser *BinlogParser) *asyncEventProcessor {
 	wm := &workerManager{
@@ -334,10 +405,16 @@ func newAsyncEventProcessor(concurrency int, queueSize int, parser *BinlogParser
 	}
 	dis.ctx, dis.cancel = context.WithCancel(context.Background())
 
+	//p := &asyncEventProcessor{
+	//	sequence:            InitSequence,
+	//	dispatcher:          dis,
+	//	currentWorkerEntity: dis.getWorkerEntity().setSequence(InitSequence),
+	//}
+
 	p := &asyncEventProcessor{
 		sequence:            InitSequence,
 		dispatcher:          dis,
-		currentWorkerEntity: dis.getWorkerEntity().setSequence(InitSequence),
+		currentWorkerEntity: &workerEntity{sequence: InitSequence},
 	}
 
 	return p
@@ -366,27 +443,66 @@ func (p *asyncEventProcessor) Process(eventType EventType, data []byte, enableSe
 	p.processNormalEvent(data, enableSemiSyncAck)
 }
 
+//// processFormatDescriptionEvent need to send this event to all worker to init parser
+//func (p *asyncEventProcessor) processFormatDescriptionEvent(data []byte, enableSemiSyncAck bool) {
+//	p.addToDispatchQueue()
+//	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck)).setInitParser(true)
+//	p.addToDispatchQueue()
+//}
+//
+//// processNormalEvent just add to current transaction buffer
+//func (p *asyncEventProcessor) processNormalEvent(data []byte, enableSemiSyncAck bool) {
+//	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck))
+//}
+//
+//// processXIDEvent send current transaction to current worker and change worker
+//func (p *asyncEventProcessor) processXIDEvent(data []byte, enableSemiSyncAck bool) {
+//	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck))
+//	p.addToDispatchQueue()
+//}
+
+// addToDispatchQueue send currentWorkerEntity to dispatcher
+//func (p *asyncEventProcessor) addToDispatchQueue() {
+//
+//	p.addToPendingDispatchQueue(p.currentWorkerEntity)
+//
+//	p.sequence++
+//	p.currentWorkerEntity = p.getWorkerEntity().setSequence(p.sequence)
+//
+//}
+
 // processFormatDescriptionEvent need to send this event to all worker to init parser
 func (p *asyncEventProcessor) processFormatDescriptionEvent(data []byte, enableSemiSyncAck bool) {
 	p.addToDispatchQueue()
-	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck)).setInitParser(true)
+	p.currentWorkerEntity.addEvent(&binLogEvent{
+		data:              data,
+		enableSemiSyncAck: enableSemiSyncAck,
+	}).setInitParser(true)
 	p.addToDispatchQueue()
 }
 
 // processNormalEvent just add to current transaction buffer
 func (p *asyncEventProcessor) processNormalEvent(data []byte, enableSemiSyncAck bool) {
-	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck))
+	p.currentWorkerEntity.addEvent(&binLogEvent{
+		data:              data,
+		enableSemiSyncAck: enableSemiSyncAck,
+	})
 }
 
 // processXIDEvent send current transaction to current worker and change worker
 func (p *asyncEventProcessor) processXIDEvent(data []byte, enableSemiSyncAck bool) {
-	p.currentWorkerEntity.addEvent(p.getBinlogEvent().setData(data).setSemiSyncAck(enableSemiSyncAck))
+	p.currentWorkerEntity.addEvent(&binLogEvent{
+		data:              data,
+		enableSemiSyncAck: enableSemiSyncAck,
+	})
 	p.addToDispatchQueue()
 }
 
-// addToDispatchQueue send currentWorkerEntity to dispatcher
 func (p *asyncEventProcessor) addToDispatchQueue() {
+
 	p.addToPendingDispatchQueue(p.currentWorkerEntity)
+
 	p.sequence++
-	p.currentWorkerEntity = p.getWorkerEntity().setSequence(p.sequence)
+	p.currentWorkerEntity = &workerEntity{sequence: p.sequence}
+
 }
